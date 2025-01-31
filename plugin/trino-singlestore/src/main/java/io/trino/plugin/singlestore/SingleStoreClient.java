@@ -29,6 +29,7 @@ import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongReadFunction;
 import io.trino.plugin.jdbc.LongWriteFunction;
+import io.trino.plugin.jdbc.PredicatePushdownController;
 import io.trino.plugin.jdbc.PreparedQuery;
 import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.RemoteTableName;
@@ -83,16 +84,17 @@ import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalDef
 import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRounding;
 import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRoundingMode;
 import static io.trino.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
+import static io.trino.plugin.jdbc.PredicatePushdownController.CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
 import static io.trino.plugin.jdbc.PredicatePushdownController.DISABLE_PUSHDOWN;
+import static io.trino.plugin.jdbc.PredicatePushdownController.FULL_PUSHDOWN;
 import static io.trino.plugin.jdbc.StandardColumnMappings.bigintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.bigintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.booleanColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.booleanWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.charReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.charWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.dateReadFunctionUsingLocalDate;
 import static io.trino.plugin.jdbc.StandardColumnMappings.decimalColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultCharColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultVarcharColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.doubleColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.doubleWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.integerColumnMapping;
@@ -109,6 +111,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.varbinaryColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.varbinaryWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.varcharReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.varcharWriteFunction;
 import static io.trino.plugin.jdbc.TypeHandlingJdbcSessionProperties.getUnsupportedTypeHandling;
 import static io.trino.plugin.jdbc.UnsupportedTypeHandling.CONVERT_TO_VARCHAR;
@@ -116,6 +119,7 @@ import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.SCHEMA_NOT_EMPTY;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
+import static io.trino.spi.type.CharType.createCharType;
 import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DecimalType.createDecimalType;
 import static io.trino.spi.type.DoubleType.DOUBLE;
@@ -132,6 +136,8 @@ import static io.trino.spi.type.Timestamps.round;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static io.trino.spi.type.VarcharType.UNBOUNDED_LENGTH;
+import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
+import static io.trino.spi.type.VarcharType.createVarcharType;
 import static java.lang.Float.floatToRawIntBits;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
@@ -307,8 +313,11 @@ public class SingleStoreClient
             case Types.DOUBLE:
                 return Optional.of(doubleColumnMapping());
             case Types.CHAR:
-            case Types.NCHAR: // TODO it it is dummy copied from StandardColumnMappings, verify if it is proper mapping
-                return Optional.of(defaultCharColumnMapping(typeHandle.requiredColumnSize(), false));
+            case Types.NCHAR:
+                return Optional.of(
+                        singlestoreDefaultCharColumnMapping(
+                                typeHandle.requiredColumnSize(),
+                                SingleStoreSessionProperties.getCaseInsensitivePredicateCharacterPushdown(session)));
             case Types.VARCHAR:
             case Types.LONGVARCHAR:
                 int columnSize = switch (jdbcTypeName) {
@@ -319,7 +328,9 @@ public class SingleStoreClient
                     case "VARCHAR" -> typeHandle.requiredColumnSize();
                     default -> throw new IllegalStateException("Unexpected type: " + jdbcTypeName);
                 };
-                return Optional.of(checkNullUsingBytes(defaultVarcharColumnMapping(columnSize, false)));
+                return Optional.of(checkNullUsingBytes(singlestoreDefaultVarcharColumnMapping(
+                        columnSize,
+                        SingleStoreSessionProperties.getCaseInsensitivePredicateCharacterPushdown(session))));
             case Types.DECIMAL:
                 int precision = typeHandle.requiredColumnSize();
                 int decimalDigits = typeHandle.requiredDecimalDigits();
@@ -361,7 +372,8 @@ public class SingleStoreClient
     private static ColumnMapping checkNullUsingBytes(ColumnMapping mapping)
     {
         if (mapping.getReadFunction() instanceof SliceReadFunction sliceReadFunction) {
-            SliceReadFunction wrapper = new SliceReadFunction() {
+            SliceReadFunction wrapper = new SliceReadFunction()
+            {
                 @Override
                 public Slice readSlice(ResultSet resultSet, int columnIndex)
                         throws SQLException
@@ -402,6 +414,47 @@ public class SingleStoreClient
         int timestampPrecision = timestampColumnSize - ZERO_PRECISION_TIMESTAMP_COLUMN_SIZE - 1;
         verify(1 <= timestampPrecision && timestampPrecision <= SINGLESTORE_DATE_TIME_MAX_PRECISION, "Unexpected timestamp precision %s calculated from timestamp column size %s", timestampPrecision, timestampColumnSize);
         return timestampPrecision;
+    }
+
+    private static ColumnMapping singlestoreDefaultCharColumnMapping(int columnSize, boolean forcePredicateCharacterPushdown)
+    {
+        if (columnSize > CharType.MAX_LENGTH) {
+            return singlestoreDefaultVarcharColumnMapping(columnSize, forcePredicateCharacterPushdown);
+        }
+        return singlestoreCharColumnMapping(createCharType(columnSize), forcePredicateCharacterPushdown);
+    }
+
+    private static ColumnMapping singlestoreCharColumnMapping(CharType charType, boolean forcePredicateCharacterPushdown)
+    {
+        requireNonNull(charType, "charType is null");
+        PredicatePushdownController pushdownController = forcePredicateCharacterPushdown
+                ? FULL_PUSHDOWN
+                : CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
+        return ColumnMapping.sliceMapping(
+                charType,
+                charReadFunction(charType),
+                charWriteFunction(),
+                pushdownController);
+    }
+
+    private static ColumnMapping singlestoreDefaultVarcharColumnMapping(int columnSize, boolean forcePredicateCharacterPushdown)
+    {
+        if (columnSize > VarcharType.MAX_LENGTH) {
+            return singlestoreVarcharColumnMapping(createUnboundedVarcharType(), forcePredicateCharacterPushdown);
+        }
+        return singlestoreVarcharColumnMapping(createVarcharType(columnSize), forcePredicateCharacterPushdown);
+    }
+
+    private static ColumnMapping singlestoreVarcharColumnMapping(VarcharType varcharType, boolean forcePredicateCharacterPushdown)
+    {
+        PredicatePushdownController pushdownController = forcePredicateCharacterPushdown
+                ? FULL_PUSHDOWN
+                : CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
+        return ColumnMapping.sliceMapping(
+                varcharType,
+                varcharReadFunction(varcharType),
+                varcharWriteFunction(),
+                pushdownController);
     }
 
     @Override
@@ -601,8 +654,10 @@ public class SingleStoreClient
                         return switch (sortItem.sortOrder()) {
                             // In SingleStore ASC implies NULLS FIRST, DESC implies NULLS LAST
                             case ASC_NULLS_FIRST, DESC_NULLS_LAST -> Stream.of(columnSorting);
-                            case ASC_NULLS_LAST -> Stream.of(format("ISNULL(%s) ASC", quoted(sortItem.column().getColumnName())), columnSorting);
-                            case DESC_NULLS_FIRST -> Stream.of(format("ISNULL(%s) DESC", quoted(sortItem.column().getColumnName())), columnSorting);
+                            case ASC_NULLS_LAST ->
+                                    Stream.of(format("ISNULL(%s) ASC", quoted(sortItem.column().getColumnName())), columnSorting);
+                            case DESC_NULLS_FIRST ->
+                                    Stream.of(format("ISNULL(%s) DESC", quoted(sortItem.column().getColumnName())), columnSorting);
                         };
                     })
                     .collect(joining(", "));

@@ -31,6 +31,7 @@ public class TestSingleStoreConfig
     {
         assertRecordedDefaults(recordDefaults(SingleStoreConfig.class)
                 .setAutoReconnect(true)
+                .setCaseInsensitivePredicateCharacterPushdown(false)
                 .setConnectionTimeout(new Duration(10, TimeUnit.SECONDS)));
     }
 
@@ -39,11 +40,13 @@ public class TestSingleStoreConfig
     {
         Map<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("singlestore.auto-reconnect", "false")
+                .put("singlestore.case-insensitive-predicate-character-pushdown", "true")
                 .put("singlestore.connection-timeout", "4s")
                 .buildOrThrow();
 
         SingleStoreConfig expected = new SingleStoreConfig()
                 .setAutoReconnect(false)
+                .setCaseInsensitivePredicateCharacterPushdown(true)
                 .setConnectionTimeout(new Duration(4, TimeUnit.SECONDS));
 
         assertFullMapping(properties, expected);

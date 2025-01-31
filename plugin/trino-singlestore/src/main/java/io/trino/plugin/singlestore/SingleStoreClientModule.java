@@ -20,6 +20,7 @@ import com.google.inject.Scopes;
 import com.google.inject.Singleton;
 import com.singlestore.jdbc.Driver;
 import io.opentelemetry.api.OpenTelemetry;
+import io.trino.plugin.base.session.SessionPropertiesProvider;
 import io.trino.plugin.jdbc.ConnectionFactory;
 import io.trino.plugin.jdbc.DecimalModule;
 import io.trino.plugin.jdbc.DriverConnectionFactory;
@@ -45,6 +46,7 @@ public class SingleStoreClientModule
         configBinder(binder).bindConfigDefaults(JdbcMetadataConfig.class, config -> config.setBulkListColumns(true));
         configBinder(binder).bindConfig(SingleStoreJdbcConfig.class);
         configBinder(binder).bindConfig(SingleStoreConfig.class);
+        newSetBinder(binder, SessionPropertiesProvider.class).addBinding().to(SingleStoreSessionProperties.class).in(Scopes.SINGLETON);
         binder.install(new DecimalModule());
         newSetBinder(binder, ConnectorTableFunction.class).addBinding().toProvider(Query.class).in(Scopes.SINGLETON);
     }
@@ -59,6 +61,7 @@ public class SingleStoreClientModule
         connectionProperties.setProperty("tinyInt1isBit", "false");
         connectionProperties.setProperty("autoReconnect", String.valueOf(singleStoreConfig.isAutoReconnect()));
         connectionProperties.setProperty("connectTimeout", String.valueOf(singleStoreConfig.getConnectionTimeout().toMillis()));
+        connectionProperties.setProperty("caseInsensitivePredicateCharacterPushdown", String.valueOf(singleStoreConfig.isCaseInsensitivePredicateCharacterPushdown()));
 
         return DriverConnectionFactory.builder(new Driver(), config.getConnectionUrl(), credentialProvider)
                 .setConnectionProperties(connectionProperties)
